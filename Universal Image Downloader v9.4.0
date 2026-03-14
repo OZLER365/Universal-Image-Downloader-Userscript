@@ -1,0 +1,898 @@
+// ==UserScript==
+// @name         Universal Image Downloader
+// @namespace    https://greasyfork.org/en/users/1553223-ozler365
+// @version      9.4.0
+// @description  Professional UI, Smart Source Scan, Strict Reader Isolation, High Performance. Mobile & Desktop friendly. (Network Blob Interception)
+// @author       ozler365
+// @license      GPL-3.0-only
+// @connect      *
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_openInTab
+// @icon         https://greasyfork.s3.us-east-2.amazonaws.com/js2dzcgf26keoaqoaqssapdpzr4z
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+// @run-at       document-start
+// @match        *://*/*
+// ==/UserScript==
+ 
+(function () {
+    'use strict';
+ 
+    if (!GM_getValue('uid_installed_redirect_v3', false)) {
+        GM_setValue('uid_installed_redirect_v3', true);
+        GM_openInTab('https://ozler365.github.io/ozler-s-works-info/#/home', { active: true, insert: true });
+    }
+ 
+    const C = {
+        zh: (navigator.language || 'en').toLowerCase().includes("zh"),
+        mob: /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth < 768
+    };
+ 
+    const i18n = {
+        subFolder: C.zh ? "文件夹名称" : "Folder Name",
+        selectAll: C.zh ? "全选" : "Select All",
+        download: C.zh ? "批量下载" : "Download All",
+        zip: C.zh ? "打包下载" : "ZIP Pack",
+        rename: C.zh ? "重命名" : "Rename",
+        original: C.zh ? "原名" : "Original",
+        menuOpen: C.zh ? "启动下载器" : "Open Downloader",
+        sort: C.zh ? "排序" : "Sort ⇅",
+        clear: C.zh ? "清空" : "Clear",
+        filter: C.zh ? "筛选" : "Filter",
+        stop: C.zh ? "停止" : "Stop",
+        width: "Width",
+        height: "Height",
+        modeDef: "Default",
+        modeNet: "Network",
+        modeBlob: C.zh ? "抓取" : "Scrapper",
+    };
+ 
+    const IMG_EXT_REGEX = /\.(jpg|jpeg|png|webp|gif|svg|bmp|tiff|avif|jfif|ico)$/i;
+    const COMMON_CDN_REGEX = new RegExp(['pstatic.net','webtoons.com','cloudinary.com','imgur.com','gstatic.com','googleusercontent.com'].join('|').replace(/\./g, '\\.'), 'i');
+    // Module-level constant — avoids new Set(...) allocation on every getStrictCanonicalUrl call
+    const CACHE_BUST_KEYS = new Set(['v','version','t','ts','timestamp','cb','cachebust','_','bust','rev','r','nocache','rand','random','nonce','token','sig','hash','etag']);
+    const MIN_SIZE = 50, MAX_RANGE = 3000;
+    const TAGS_TO_SCAN = 'img, div, span, a, section, header, main, article, li, figure';
+ 
+    let currentMode = GM_getValue('uid_mode', 'default');
+    if (currentMode === true || currentMode === 'network') currentMode = 'network';
+    else if (currentMode === 'blob') currentMode = 'blob';
+    else currentMode = 'default';
+ 
+    let uiZoom = GM_getValue('uid_zoom_v1', 1);
+    let isDownloading = false, isUiOpen = false, isDirty = true, renderScheduled = false;
+    let sortState = 0;
+    let imgData = [], displayedIndices = [];
+ 
+    const selIdx = new Set(), seen = new Set(), networkSeen = new Set(), safeBlobMap = new Map();
+    const seenStrict = new Set();
+    const canvasMap = new Map();
+    const imageHashes = new Set();
+    const interceptedQueue = [], capturedNetworkQueue = [];
+    let scannedElements = new WeakSet();
+    // Default-mode only: tracks canvas elements that had drawImage() called on them so that
+    // the toDataURL() fallback scan in scanPageOrdered skips them — their source images are
+    // already captured via the drawImage / createObjectURL intercept pipeline, and
+    // canvas.toDataURL() re-encodes the JPEG, producing a different SHA-256 hash that would
+    // bypass the imageHashes dedup check and create duplicates.
+    let interceptedCanvases = new WeakSet();
+ 
+    const domObservedImgs = new WeakSet();
+    const domLoadQueue = [];
+    let domLoadTimer = null;
+ 
+    function queueDomLoadUrl(rawUrl) {
+        if (currentMode !== 'default') return;
+        if (!rawUrl || rawUrl.length < 10 || rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) return;
+        if (/\/(1x1|pixel|tracker|beacon)\./i.test(rawUrl)) return;
+        try {
+            const abs = (rawUrl.startsWith('http') || rawUrl.startsWith('blob:'))
+                ? rawUrl : new URL(rawUrl, docBaseURI).href;
+            const cUrl = getCanonicalUrl(abs);
+            if (seen.has(cUrl)) return;
+            const sc = getStrictCanonicalUrl(abs);
+            if (seenStrict.has(sc)) return;
+            domLoadQueue.push(abs);
+            if (!domLoadTimer) domLoadTimer = setTimeout(processDomLoadQueue, 400);
+        } catch {}
+    }
+ 
+    async function processDomLoadQueue() {
+        domLoadTimer = null;
+        if (!domLoadQueue.length || currentMode !== 'default') return;
+        const batch = domLoadQueue.splice(0, domLoadQueue.length);
+        let newData = false;
+        for (const url of batch) {
+            if (currentMode !== 'default') break;
+            if (seen.has(getCanonicalUrl(url))) continue;
+            // tryAddImage handles dimension fetching internally when w/h are 0
+            if (await tryAddImage({ url, w: 0, h: 0 })) newData = true;
+        }
+        if (isUiOpen && newData) scheduleRender();
+    }
+ 
+    function observeImgForLoad(img) {
+        if (currentMode !== 'default' || domObservedImgs.has(img)) return;
+        domObservedImgs.add(img);
+        const src = img.currentSrc || img.src;
+        if (src) queueDomLoadUrl(src);
+        img.addEventListener('load', function () {
+            const loaded = img.currentSrc || img.src;
+            if (loaded) queueDomLoadUrl(loaded);
+        }, { passive: true });
+    }
+ 
+    let themeTimeout, scrollTimeout;
+    let docBaseURI = document.baseURI;
+    let _pageOriginCache = ''; // cached lazily, invalidated when docBaseURI changes
+ 
+    const origCreateObjectURL = window.URL ? window.URL.createObjectURL : null;
+    const createObjUrl = (b) => origCreateObjectURL ? origCreateObjectURL.call(window.URL, b) : URL.createObjectURL(b);
+ 
+    const getSafeUrl = (url) => {
+        if (typeof url === 'string' && url.startsWith('blob:')) {
+            let end = url.length;
+            const hIdx = url.indexOf('#'), qIdx = url.indexOf('?');
+            if (hIdx > -1) end = hIdx;
+            if (qIdx > -1 && qIdx < end) end = qIdx;
+            return safeBlobMap.get(url.substring(0, end)) || url;
+        }
+        return url;
+    };
+ 
+    function scheduleThemeUpdate() {
+        if (themeTimeout) return;
+        themeTimeout = requestAnimationFrame(() => { if (isUiOpen) updateThemeColors(); themeTimeout = null; });
+    }
+ 
+    const triggerScan = (mutations) => {
+        isDirty = true;
+        if (mutations) for (let i = 0; i < mutations.length; i++) scannedElements.delete(mutations[i].target);
+        scheduleThemeUpdate();
+    };
+ 
+    window.addEventListener('scroll', () => {
+        if (!isUiOpen || scrollTimeout) return;
+        scrollTimeout = setTimeout(() => { isDirty = true; scrollTimeout = null; }, 300);
+    }, { passive: true });
+ 
+    window.addEventListener('load', () => { isDirty = true; }, true);
+ 
+    // Single merged observer: handles theme/scan dirty-marking + default-mode lazy-load img tracking
+    new MutationObserver((mutations) => {
+        isDirty = true;
+        for (let i = 0; i < mutations.length; i++) {
+            const mut = mutations[i];
+            scannedElements.delete(mut.target);
+            if (currentMode === 'default') {
+                if (mut.type === 'childList') {
+                    for (let j = 0; j < mut.addedNodes.length; j++) {
+                        const node = mut.addedNodes[j];
+                        if (node.nodeType !== 1) continue;
+                        if (node.tagName === 'IMG') observeImgForLoad(node);
+                        else { const imgs = node.getElementsByTagName('img'); for (let k = 0; k < imgs.length; k++) observeImgForLoad(imgs[k]); }
+                    }
+                } else if (mut.type === 'attributes' && mut.target.tagName === 'IMG') {
+                    const src = mut.target.currentSrc || mut.target.getAttribute('src');
+                    if (src) queueDomLoadUrl(src);
+                    observeImgForLoad(mut.target);
+                }
+            }
+        }
+        scheduleThemeUpdate();
+    }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'style', 'class', 'data-src', 'data-original', 'data-theme', 'srcset', 'data-lazy'] });
+ 
+    new MutationObserver(() => { docBaseURI = document.baseURI; _pageOriginCache = ''; }).observe(document.head, { childList: true, subtree: true });
+ 
+    function getAbsUrl(url) {
+        if (!url || typeof url !== 'string' || url.startsWith('blob:') || url.startsWith('data:')) return url;
+        if (url.startsWith('http')) return url;
+        try { return new URL(url, docBaseURI).href; } catch { return url; }
+    }
+ 
+    function getCanonicalUrl(url) {
+        if (!url || typeof url !== 'string' || url.startsWith('data:') || url.startsWith('blob:')) return url;
+        const qIdx = url.indexOf('?');
+        const clean = qIdx > -1 ? url.substring(0, qIdx) : url;
+        return IMG_EXT_REGEX.test(clean) ? clean : url;
+    }
+ 
+    // Default-mode only: aggressively normalise URLs to catch same-image arriving via variant params.
+    function getStrictCanonicalUrl(url) {
+        if (!url || typeof url !== 'string' || url.startsWith('data:') || url.startsWith('blob:')) return url;
+        try {
+            const u = new URL(url);
+            const basePath = u.origin + u.pathname;
+            if (IMG_EXT_REGEX.test(u.pathname)) return basePath.toLowerCase();
+            const params = new URLSearchParams(u.search);
+            for (const key of [...params.keys()]) {
+                if (CACHE_BUST_KEYS.has(key.toLowerCase())) params.delete(key);
+            }
+            const qs = params.toString();
+            return (basePath + (qs ? '?' + qs : '')).toLowerCase();
+        } catch { return getCanonicalUrl(url); }
+    }
+ 
+    function getFilename(url) {
+        if (!url || url.startsWith('data:')) return 'image_' + Date.now();
+        const qIdx = url.indexOf('?');
+        const clean = qIdx > -1 ? url.substring(0, qIdx) : url;
+        const sIdx = clean.lastIndexOf('/');
+        if (sIdx > -1) {
+            const name = decodeURIComponent(clean.substring(sIdx + 1)).replace(/[\\/:*?"<>|]/g, '_');
+            return name || 'image_' + Date.now();
+        }
+        return 'image_' + Date.now();
+    }
+ 
+    function isDarkTheme() {
+        const body = document.body, html = document.documentElement;
+        if (!body) return false;
+        if (html.classList.contains('dark') || body.classList.contains('dark') || html.getAttribute('data-theme') === 'dark') return true;
+        if (html.classList.contains('light') || body.classList.contains('light') || html.getAttribute('data-theme') === 'light') return false;
+        const bg = window.getComputedStyle(body).backgroundColor;
+        if (bg && bg.includes('rgb')) {
+            const rgb = bg.match(/\d+/g);
+            if (rgb && rgb.length >= 3) return (0.299 * parseInt(rgb[0], 10) + 0.587 * parseInt(rgb[1], 10) + 0.114 * parseInt(rgb[2], 10)) < 128;
+        }
+        return window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+    }
+ 
+    function updateThemeColors() {
+        const overlay = document.querySelector('.tyc-overlay');
+        if (!overlay) return;
+        const dark = isDarkTheme(), vars = overlay.style;
+        if (dark) {
+            vars.setProperty('--tyc-bg', '#1f2937'); vars.setProperty('--tyc-fg', '#f3f4f6'); vars.setProperty('--tyc-header', '#111827');
+            vars.setProperty('--tyc-border', '#374151'); vars.setProperty('--tyc-grid', '#0f1419'); vars.setProperty('--tyc-card', '#1f2937');
+            vars.setProperty('--tyc-input', '#374151'); vars.setProperty('--tyc-input-text', '#f3f4f6'); vars.setProperty('--tyc-btn-gray', '#374151');
+            vars.setProperty('--tyc-track', '#374151');
+        } else {
+            vars.setProperty('--tyc-bg', '#fcfcfc'); vars.setProperty('--tyc-fg', '#1f2937'); vars.setProperty('--tyc-header', '#fff');
+            vars.setProperty('--tyc-border', '#e0e0e0'); vars.setProperty('--tyc-grid', '#f9fafb'); vars.setProperty('--tyc-card', '#fff');
+            vars.setProperty('--tyc-input', '#fff'); vars.setProperty('--tyc-input-text', '#1f2937'); vars.setProperty('--tyc-btn-gray', '#f3f4f6');
+            vars.setProperty('--tyc-track', '#e5e7eb');
+        }
+    }
+ 
+    const originalDrawImage = CanvasRenderingContext2D.prototype.drawImage;
+    // Use arguments instead of ...args spread — avoids array allocation on every single drawImage call
+    CanvasRenderingContext2D.prototype.drawImage = function () {
+        if (this._isInternal) return originalDrawImage.apply(this, arguments);
+        originalDrawImage.apply(this, arguments);
+        try {
+            const w = this.canvas.width, h = this.canvas.height;
+            if (w < MIN_SIZE || h < MIN_SIZE) return;
+            const image = arguments[0];
+            let src = image.src;
+            if (!src || src.startsWith("data:") || src.length < 20 || /thumbnail|avatar|logo|icon/.test(src)) return;
+ 
+            if (src.startsWith('blob:')) {
+                const base = src.split('#')[0].split('?')[0];
+                if (safeBlobMap.has(base)) src = safeBlobMap.get(base);
+            }
+ 
+            const cSrc = getCanonicalUrl(src);
+            if (!canvasMap.has(cSrc)) {
+                canvasMap.set(cSrc, { url: src, width: w, height: h, instructions: [], isScrambled: false });
+                interceptedQueue.push(src);
+            }
+            // Default-mode: mark this canvas so the toDataURL() fallback scan skips it.
+            // The source image is already being captured; a re-encoded toDataURL() copy
+            // would have a different SHA-256 hash and slip through the dedup check.
+            if (currentMode === 'default') interceptedCanvases.add(this.canvas);
+ 
+            const entry = canvasMap.get(cSrc);
+            const wasScrambled = entry.isScrambled;
+            const iw = image.naturalWidth || image.width || 0;
+            const ih = image.naturalHeight || image.height || 0;
+            const ac = arguments.length - 1;
+            let p;
+            if (ac === 8) {
+                p = { sx: arguments[1], sy: arguments[2], sw: arguments[3], sh: arguments[4], dx: arguments[5], dy: arguments[6], dw: arguments[7], dh: arguments[8] };
+            } else if (ac === 4) {
+                p = { sx: 0, sy: 0, sw: iw, sh: ih, dx: arguments[1], dy: arguments[2], dw: arguments[3], dh: arguments[4] };
+            } else {
+                p = { sx: 0, sy: 0, sw: iw, sh: ih, dx: arguments[1] || 0, dy: arguments[2] || 0, dw: iw, dh: ih };
+            }
+ 
+            entry.instructions.push(p);
+            entry.width = Math.max(entry.width, p.dx + p.dw);
+            entry.height = Math.max(entry.height, p.dy + p.dh);
+            if (entry.instructions.length > 1 || p.sx > 0 || p.sy > 0) entry.isScrambled = true;
+            if (entry.isScrambled && !wasScrambled && isUiOpen) scheduleRender();
+        } catch {}
+    };
+ 
+    const origFetch = window.fetch;
+    const origXHR = window.XMLHttpRequest.prototype.open;
+    const isImageUrl = (url) => url && typeof url === 'string' && IMG_EXT_REGEX.test(url) && !url.startsWith('data:');
+ 
+    function isImageFromCurrentPage(url) {
+        try {
+            if (!_pageOriginCache) _pageOriginCache = new URL(docBaseURI).origin;
+            if (url.startsWith(_pageOriginCache) || COMMON_CDN_REGEX.test(url.toLowerCase())) return true;
+            try { return new URL(url).origin === _pageOriginCache; } catch {}
+            return false;
+        } catch { return false; }
+    }
+ 
+    function addToNetworkQueue(url, isBlob = false) {
+        if (currentMode === 'default' && !isBlob && !isImageFromCurrentPage(url)) return;
+        const abs = getAbsUrl(url);
+        if (abs && !networkSeen.has(abs)) {
+            networkSeen.add(abs);
+            capturedNetworkQueue.push(abs);
+        }
+    }
+ 
+    if (origCreateObjectURL) {
+        window.URL.createObjectURL = function (obj) {
+            const url = origCreateObjectURL.apply(this, arguments);
+            if (!isDownloading && obj instanceof Blob) {
+                const type = obj.type || '';
+                if (type.startsWith('image/') || type === 'application/octet-stream' || type === '') {
+                    try {
+                        const safeUrl = origCreateObjectURL.call(window.URL, obj);
+                        safeBlobMap.set(url, safeUrl);
+                        addToNetworkQueue(safeUrl, true);
+                    } catch {}
+                }
+            }
+            return url;
+        };
+    }
+ 
+    // Use arguments instead of ...args spread to avoid array allocation on every fetch call
+    window.fetch = function () {
+        const fetchPromise = origFetch.apply(this, arguments);
+        if (currentMode === 'network' || currentMode === 'default') {
+            try {
+                const url = arguments[0] instanceof Request ? arguments[0].url : arguments[0];
+                if (typeof url === 'string') {
+                    if (isImageUrl(url)) addToNetworkQueue(url);
+                    else if (currentMode === 'network' || isImageFromCurrentPage(url)) {
+                        fetchPromise.then(res => {
+                            if (res.headers.get('content-type')?.startsWith('image/')) addToNetworkQueue(url);
+                            return res;
+                        }).catch(() => {});
+                    }
+                }
+            } catch {}
+        }
+        return fetchPromise;
+    };
+ 
+    window.XMLHttpRequest.prototype.open = function (method, url) {
+        if ((currentMode === 'network' || currentMode === 'default') && typeof url === 'string') {
+            if (isImageUrl(url)) addToNetworkQueue(url);
+            else if (currentMode === 'network' || isImageFromCurrentPage(url)) {
+                this.addEventListener('readystatechange', function () {
+                    if (this.readyState === 2 || this.readyState === 4) {
+                        try { if (this.getResponseHeader('Content-Type')?.startsWith('image/')) addToNetworkQueue(url); } catch {}
+                    }
+                });
+            }
+        }
+        return origXHR.apply(this, arguments);
+    };
+ 
+    if (window.PerformanceObserver) {
+        new PerformanceObserver((l) => {
+            if (currentMode !== 'network' && currentMode !== 'default') return;
+            l.getEntries().forEach(e => {
+                if (e.initiatorType === 'img' || e.initiatorType === 'css' || isImageUrl(e.name)) addToNetworkQueue(e.name);
+            });
+        }).observe({ entryTypes: ["resource"] });
+    }
+ 
+    const getImageBlob = (url) => new Promise((resolve, reject) => {
+        const fetchUrl = getSafeUrl(url);
+        if (fetchUrl.startsWith('data:') || fetchUrl.startsWith('blob:')) return fetch(fetchUrl).then(r => r.blob()).then(resolve).catch(reject);
+        fetch(fetchUrl, { cache: "force-cache" })
+            .then(res => res.ok ? res.blob() : Promise.reject())
+            .then(b => b.size > 512 ? resolve(b) : Promise.reject())
+            .catch(() => GM_xmlhttpRequest({
+                method: "GET", url: fetchUrl, responseType: "blob",
+                headers: { "Referer": window.location.href, "Accept": "image/*" },
+                onload: (r) => (r.status === 200 && r.response.size > 512) ? resolve(r.response) : reject(),
+                onerror: reject
+            }));
+    });
+ 
+    const convertToJpeg = (blob) => new Promise((resolve) => {
+        if (blob.type === 'image/jpeg') return resolve(blob);
+        const img = new Image();
+        const url = createObjUrl(blob);
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = img.width; c.height = img.height;
+            const ctx = c.getContext('2d');
+            ctx._isInternal = true;
+            ctx.fillStyle = '#FFF'; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(img, 0, 0);
+            c.toBlob(b => { URL.revokeObjectURL(url); c.width = 0; c.height = 0; img.onload = img.onerror = null; resolve(b || blob); }, 'image/jpeg', 0.9);
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); img.onload = img.onerror = null; resolve(blob); };
+        img.src = url;
+    });
+ 
+    const unscrambleImage = (blob, ops, w, h) => new Promise((resolve, reject) => {
+        const url = createObjUrl(blob);
+        const img = new Image();
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            const ctx = c.getContext('2d');
+            ctx._isInternal = true;
+            for (let i = 0; i < ops.length; i++) {
+                const o = ops[i];
+                ctx.drawImage(img, o.sx, o.sy, o.sw, o.sh, o.dx, o.dy, o.dw, o.dh);
+            }
+            c.toBlob(b => { URL.revokeObjectURL(url); c.width = 0; c.height = 0; img.onload = img.onerror = null; resolve(b); }, 'image/png');
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); img.onload = img.onerror = null; reject(); };
+        img.src = url;
+    });
+ 
+    function parseBestSrcset(srcset) {
+        if (!srcset || typeof srcset !== 'string') return null;
+        let bestUrl = null, bestVal = -1;
+        const entries = srcset.split(',');
+        for (let i = 0; i < entries.length; i++) {
+            const parts = entries[i].trim().split(/\s+/);
+            if (!parts[0]) continue;
+            const descriptor = parts[1] || '1x';
+            let val = descriptor.endsWith('w') ? parseFloat(descriptor) : descriptor.endsWith('x') ? parseFloat(descriptor) * 1000 : 1;
+            if (isNaN(val)) val = 1;
+            if (val > bestVal) { bestVal = val; bestUrl = parts[0]; }
+        }
+        return bestUrl;
+    }
+ 
+    const getImageDimensions = (url) => new Promise((resolve) => {
+        const img = new Image();
+        const t = setTimeout(() => { img.onload = img.onerror = null; resolve({ ok: false }); }, 3000);
+        img.onload = () => { clearTimeout(t); img.onload = img.onerror = null; resolve({ w: img.width, h: img.height, ok: true }); };
+        img.onerror = () => { clearTimeout(t); img.onload = img.onerror = null; resolve({ ok: false }); };
+        img.src = url;
+    });
+ 
+    async function updatePreview(imgObj, imgEl) {
+        const d = canvasMap.get(getCanonicalUrl(imgObj.url));
+        if (d?.isScrambled) {
+            try {
+                const b = await getImageBlob(imgObj.url);
+                const ub = await unscrambleImage(b, d.instructions, d.width, d.height);
+                const u = createObjUrl(ub);
+                imgObj.previewUrl = u;
+                imgEl.src = u;
+            } catch {}
+        }
+    }
+ 
+    function clearCache(recover = true) {
+        imgData.forEach(i => i.previewUrl && URL.revokeObjectURL(i.previewUrl));
+        imgData = []; selIdx.clear(); seen.clear(); networkSeen.clear(); seenStrict.clear();
+        canvasMap.clear(); imageHashes.clear(); interceptedQueue.length = 0; capturedNetworkQueue.length = 0;
+        scannedElements = new WeakSet();
+        interceptedCanvases = new WeakSet();
+ 
+        if (recover) {
+            if (currentMode !== 'blob') {
+                if (window.performance) {
+                    performance.getEntriesByType("resource").forEach(e => {
+                        if (e.initiatorType === 'img' || e.initiatorType === 'css' || isImageUrl(e.name)) addToNetworkQueue(e.name);
+                    });
+                }
+            }
+            // All modes re-queue captured blobs
+            safeBlobMap.forEach(safeUrl => addToNetworkQueue(safeUrl, true));
+        } else {
+            isDirty = false;
+        }
+ 
+        if (isUiOpen) scheduleRender();
+    }
+ 
+    async function scanPageOrdered() {
+        const els = document.querySelectorAll(TAGS_TO_SCAN);
+        const imageData = [], smallImageData = [], loc = new Set();
+        const bgRegex = /url\(['"]?([^'"]+)['"]?\)/g;
+        let batchTime = performance.now();
+ 
+        if (currentMode === 'default') {
+            const allImgs = document.querySelectorAll('img');
+            for (let j = 0; j < allImgs.length; j++) observeImgForLoad(allImgs[j]);
+        }
+ 
+        for (let i = 0; i < els.length; i++) {
+            if (i % 100 === 0 && (performance.now() - batchTime > 10)) {
+                await new Promise(r => requestAnimationFrame(r));
+                batchTime = performance.now();
+            }
+ 
+            const el = els[i];
+            if (scannedElements.has(el) || el.closest?.('.tyc-modal') || el.closest?.('.tyc-overlay')) continue;
+ 
+            let candidates = [];
+ 
+            if (el.tagName === 'IMG') {
+                observeImgForLoad(el);
+                const nw = el.naturalWidth, nh = el.naturalHeight;
+                const attrs = [
+                    el.getAttribute('data-original'), el.getAttribute('data-src'), el.dataset?.src,
+                    el.getAttribute('data-lazy'), el.getAttribute('data-lazy-src'), el.getAttribute('data-image'),
+                    el.getAttribute('data-large'), el.getAttribute('data-full'), el.getAttribute('data-img'),
+                    el.getAttribute('data-original-src'), el.currentSrc, el.src
+                ];
+                const srcsetUrl = parseBestSrcset(el.getAttribute('srcset') || el.getAttribute('data-srcset'));
+                if (srcsetUrl) attrs.push(srcsetUrl);
+ 
+                const picture = el.closest('picture');
+                if (picture) {
+                    const sources = picture.querySelectorAll('source');
+                    for (let si = 0; si < sources.length; si++) {
+                        const ss = parseBestSrcset(sources[si].getAttribute('srcset'));
+                        if (ss) attrs.push(ss);
+                        attrs.push(sources[si].getAttribute('src'));
+                    }
+                }
+ 
+                attrs.forEach(src => { if (src) candidates.push({ url: src, w: nw, h: nh }); });
+ 
+            } else if (el.offsetWidth > 0 || el.offsetHeight > 0) {
+                let bg = el.style.backgroundImage;
+                if (!bg || bg === 'none' || !bg.includes('url(')) bg = window.getComputedStyle(el).backgroundImage;
+                if (bg && bg.includes('url(')) {
+                    let match;
+                    bgRegex.lastIndex = 0;
+                    while ((match = bgRegex.exec(bg)) !== null) candidates.push({ url: match[1], w: 0, h: 0 });
+                }
+            }
+ 
+            let best = null;
+            for (let j = 0; j < candidates.length; j++) {
+                let item = candidates[j], src = item.url;
+                if (!src || src === docBaseURI) continue;
+                if (src.startsWith('data:')) {
+                    if (src.length < 1366) continue;
+                } else if (/\/(1x1|pixel|tracker|beacon)\./i.test(src)) {
+                    continue;
+                }
+                if (!src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:')) {
+                    try { src = new URL(src, docBaseURI).href; } catch { continue; }
+                }
+                const score = src.startsWith('http') ? 3 : src.startsWith('blob:') ? 2 : 1;
+                if (!best || score > best.score) best = { src, w: item.w, h: item.h, score };
+            }
+ 
+            if (best) {
+                const cUrl = getCanonicalUrl(best.src);
+                const isSmall = (best.w > 0 && best.h > 0 && best.w < MIN_SIZE && best.h < MIN_SIZE);
+                if (!seen.has(cUrl) && !loc.has(cUrl)) {
+                    scannedElements.add(el);
+                    loc.add(cUrl);
+                    const rect = el.getBoundingClientRect();
+                    const info = { url: best.src, w: best.w || 0, h: best.h || 0, position: { top: rect.top + window.scrollY, left: rect.left + window.scrollX } };
+                    if (isSmall) smallImageData.push(info);
+                    else imageData.push(info);
+                }
+            }
+        }
+ 
+        const allCanvases = document.querySelectorAll('canvas');
+        for (let i = 0; i < allCanvases.length; i++) {
+            const c = allCanvases[i];
+            if (c.width > 50) {
+                // Default mode: skip canvases whose source images are already being captured
+                // via the drawImage / createObjectURL intercept pipeline. canvas.toDataURL()
+                // re-encodes the image (producing a different hash) and causes duplicates.
+                if (currentMode === 'default' && interceptedCanvases.has(c)) continue;
+                try {
+                    const dataUrl = c.toDataURL("image/jpeg", 0.95);
+                    if (dataUrl && dataUrl.length > 1366) {
+                        const rect = c.getBoundingClientRect();
+                        imageData.push({ url: dataUrl, w: c.width, h: c.height, position: { top: rect.top + window.scrollY, left: rect.left + window.scrollX } });
+                    }
+                } catch {}
+            }
+        }
+ 
+        const sortFn = (a, b) => {
+            const topDiff = a.position.top - b.position.top;
+            return Math.abs(topDiff) > 10 ? topDiff : a.position.left - b.position.left;
+        };
+ 
+        return [...imageData.sort(sortFn), ...smallImageData.sort(sortFn)].map(item => ({ url: item.url, w: item.w, h: item.h }));
+    }
+ 
+    const delSafeBlob = (u) => {
+        URL.revokeObjectURL(u);
+        for (const [k, v] of safeBlobMap.entries()) if (v === u) { safeBlobMap.delete(k); break; }
+    };
+ 
+    // Direct typed-array loop — avoids Array.from copy and .map() overhead
+    async function hashBlob(blob) {
+        const buf = new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()));
+        let s = '';
+        for (let i = 0; i < buf.length; i++) s += buf[i].toString(16).padStart(2, '0');
+        return s;
+    }
+ 
+    async function tryAddImage(itm) {
+        if (itm.url.startsWith('blob:')) {
+            const base = itm.url.split('#')[0].split('?')[0];
+            if (safeBlobMap.has(base)) itm.url = safeBlobMap.get(base);
+        }
+ 
+        const c = getCanonicalUrl(itm.url);
+        if (seen.has(c)) return false;
+        seen.add(c);
+ 
+        // Default mode: strict URL-level pre-check catches same image via variant CDN/cache-bust URLs
+        if (currentMode === 'default') {
+            const sc = getStrictCanonicalUrl(itm.url);
+            if (seenStrict.has(sc)) return false;
+            seenStrict.add(sc);
+        }
+ 
+        try {
+            const blob = await getImageBlob(itm.url);
+            const hash = await hashBlob(blob);
+            if (imageHashes.has(hash)) {
+                if (itm.url.startsWith('blob:')) delSafeBlob(itm.url);
+                return false;
+            }
+            imageHashes.add(hash);
+            if (currentMode === 'default' && (itm.w === 0 || itm.h === 0)) {
+                const d = await getImageDimensions(getSafeUrl(itm.url));
+                if (d.ok) { itm.w = d.w; itm.h = d.h; }
+            }
+            imgData.push(itm);
+            return true;
+        } catch {
+            // Default mode: can't hash → can't guarantee uniqueness → skip to prevent duplicates
+            if (currentMode === 'default') return false;
+            imgData.push(itm);
+            return true;
+        }
+    }
+ 
+    async function backgroundLoop() {
+        let newData = false;
+ 
+        while (interceptedQueue.length) {
+            const u = interceptedQueue.shift();
+            if (currentMode === 'blob' && !u.startsWith('blob:')) continue;
+            const c = getCanonicalUrl(u), d = canvasMap.get(c);
+            if (d && !seen.has(c)) {
+                if (await tryAddImage({ url: u, w: d.width, h: d.height })) newData = true;
+            }
+        }
+ 
+        if ((currentMode === 'network' || currentMode === 'blob' || currentMode === 'default') && capturedNetworkQueue.length) {
+            const batch = capturedNetworkQueue.splice(0, 20);
+            const res = await Promise.all(batch.map(async u => {
+                const d = await getImageDimensions(u);
+                if (!d.ok && u.startsWith('blob:')) delSafeBlob(u);
+                return d.ok ? { url: u, w: d.w, h: d.h } : null;
+            }));
+            for (let i = 0; i < res.length; i++) {
+                if (res[i] && await tryAddImage(res[i])) newData = true;
+            }
+        }
+ 
+        if (currentMode === 'default' && isUiOpen && isDirty) {
+            const imgs = await scanPageOrdered();
+            isDirty = false;
+            for (let i = 0; i < imgs.length; i++) {
+                if (await tryAddImage(imgs[i])) newData = true;
+            }
+        }
+ 
+        if (isUiOpen && newData) scheduleRender();
+        // Faster tick when UI is open and processing; slower when idle
+        setTimeout(backgroundLoop, isUiOpen ? 800 : 1500);
+    }
+ 
+    function scheduleRender() {
+        if (renderScheduled) return;
+        renderScheduled = true;
+        requestAnimationFrame(() => { renderScheduled = false; render(); });
+    }
+ 
+    function render() {
+        const grid = document.getElementById("tyc-grid"), cnt = document.getElementById("tyc-cnt");
+        if (!grid) return;
+ 
+        const gV = (id) => parseInt(document.getElementById(id)?.value, 10);
+        const gC = (id) => document.getElementById(id)?.checked;
+        const minW = gC("tyc-chk-min-w") ? (gV("tyc-min-w")||MIN_SIZE) : MIN_SIZE;
+        const maxW = gC("tyc-chk-max-w") ? (gV("tyc-max-w")||99999) : 99999;
+        const minH = gC("tyc-chk-min-h") ? (gV("tyc-min-h")||MIN_SIZE) : MIN_SIZE;
+        const maxH = gC("tyc-chk-max-h") ? (gV("tyc-max-h")||99999) : 99999;
+ 
+        let f = imgData.filter(i => i.w >= minW && i.w <= maxW && i.h >= minH && i.h <= maxH);
+ 
+        if (sortState === 1) f.reverse();
+        else if (sortState === 2) f.sort((a, b) => getFilename(a.url).localeCompare(getFilename(b.url), undefined, { numeric: true, sensitivity: 'base' }));
+        else if (sortState === 3) f.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+        else if (sortState === 4) f.sort((a, b) => (a.w * a.h) - (b.w * b.h));
+ 
+        displayedIndices = f;
+        selIdx.clear();
+        const all = document.getElementById("tyc-all")?.checked;
+        const frag = document.createDocumentFragment();
+ 
+        for (let idx = 0; idx < f.length; idx++) {
+            const img = f[idx];
+            if (all) selIdx.add(idx);
+            const scr = canvasMap.get(getCanonicalUrl(img.url))?.isScrambled;
+            const d = document.createElement("div");
+            d.className = "tyc-card" + (all ? " selected" : "");
+            const i = document.createElement("img");
+            i.loading = "lazy";
+            if (img.previewUrl) i.src = img.previewUrl;
+            else {
+                i.src = getSafeUrl(img.url);
+                if (scr) updatePreview(img, i);
+            }
+            d.innerHTML = `<div style="position:absolute;bottom:0;right:0;background:rgba(0,0,0,0.6);color:#fff;font-size:10px;padding:2px 4px;border-top-left-radius:4px">${img.w}x${img.h}</div>`;
+            d.prepend(i);
+            d.onclick = () => {
+                selIdx.has(idx) ? selIdx.delete(idx) : selIdx.add(idx);
+                d.classList.toggle("selected");
+                if (cnt) cnt.innerText = selIdx.size;
+            };
+            frag.appendChild(d);
+        }
+ 
+        grid.innerHTML = "";
+        grid.appendChild(frag);
+        if (cnt) cnt.innerText = selIdx.size;
+    }
+ 
+    function createUI() {
+        const css = `.tyc-overlay{position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483640;display:flex;justify-content:center;align-items:center;font-family:sans-serif;pointer-events:none}.tyc-modal{width:90vw;height:85vh;background:var(--tyc-bg);color:var(--tyc-fg);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;resize:both;min-width:650px;box-shadow:0 10px 40px rgba(0,0,0,.4);border:1px solid #444;pointer-events:auto;transition:background .2s,color .2s;transform-origin:center center;will-change:transform}.tyc-header{padding:12px 20px;background:var(--tyc-header);border-bottom:1px solid var(--tyc-border);display:flex;flex-direction:column;gap:10px;cursor:move;user-select:none;transition:background .2s}.tyc-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;width:100%}.tyc-input{padding:6px 10px;border:1px solid #ccc;border-radius:4px;width:120px;font-size:13px;background:var(--tyc-input);color:var(--tyc-input-text)}.tyc-input-sm{width:50px;padding:4px;text-align:right}.tyc-chk{appearance:checkbox!important;-webkit-appearance:checkbox!important;width:14px!important;height:14px!important;opacity:1!important;visibility:visible!important;display:inline-block!important;margin:0 2px!important;cursor:pointer!important;position:static!important;box-shadow:none!important;background-color:initial!important}.tyc-btn{padding:6px 12px;border-radius:6px;border:none;cursor:pointer;font-weight:600;font-size:12px;color:#fff;min-width:70px;transition:.2s}.tyc-btn-blue{background:#2563eb}.tyc-btn-green{background:#10b981}.tyc-btn-red{background:#ef4444}.tyc-btn-purple{background:#8b5cf6}.tyc-btn-orange{background:#f59e0b}.tyc-btn-gray{background:var(--tyc-btn-gray);color:var(--tyc-fg);border:1px solid var(--tyc-border)}.tyc-btn-bmc{background:#FFDD00;color:#000}.tyc-grid{flex:1;overflow-y:auto;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));grid-auto-rows:220px;gap:12px;background:var(--tyc-grid)}.tyc-card{background:var(--tyc-card);border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1);cursor:pointer;overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;border:2px solid transparent}.tyc-card:hover{transform:translateY(-2px);box-shadow:0 4px 6px rgba(0,0,0,0.1)}.tyc-card.selected{border-color:#2563eb}.tyc-card.selected::before{content:"✓";position:absolute;top:5px;right:5px;background:#2563eb;color:#fff;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;z-index:2}.tyc-card img{width:100%;height:100%;object-fit:cover}.range-wrapper{position:relative;height:16px;width:100%;margin:6px 0;display:flex;align-items:center}.range-track-bg{position:absolute;width:100%;height:4px;background:var(--tyc-track);border-radius:2px}.range-track-active{position:absolute;height:4px;background:#2563eb;pointer-events:none;opacity:0.3}.range-track-active.enabled{opacity:1}.range-wrapper input[type=range]{-webkit-appearance:none;position:absolute;width:100%;background:none;pointer-events:none;margin:0;outline:none}.range-wrapper input[type=range]::-webkit-slider-thumb{pointer-events:auto;-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#9ca3af;cursor:pointer;border:2px solid #fff;box-shadow:0 1px 2px rgba(0,0,0,0.2)}.range-wrapper input[type=range]::-moz-range-thumb{pointer-events:auto;border:none;width:14px;height:14px;border-radius:50%;background:#9ca3af;cursor:pointer;border:2px solid #fff;box-shadow:0 1px 2px rgba(0,0,0,0.2)}.range-wrapper input[type=range]:not(:disabled)::-webkit-slider-thumb{background:#2563eb}.range-wrapper input[type=range]:not(:disabled)::-moz-range-thumb{background:#2563eb}@media screen and (max-width: 768px){.tyc-modal{width:95vw!important;min-width:0!important;max-height:90vh!important;top:auto!important;left:auto!important;margin:0 auto!important}.tyc-grid{padding:10px;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));grid-auto-rows:140px}.tyc-header{padding:8px 10px;gap:8px;overflow-y:auto;max-height:45vh}.tyc-btn{padding:8px 10px;min-width:40px}.tyc-input{width:80px}.tyc-row{gap:6px}.tyc-filter-container{flex-direction:column!important;gap:10px!important}.tyc-filter-item{min-width:100%!important}.range-wrapper input[type=range]{pointer-events:none;touch-action:none}.range-wrapper input[type=range]::-webkit-slider-thumb{pointer-events:auto;touch-action:none;width:24px;height:24px;z-index:10;position:relative}.range-wrapper input[type=range]::-moz-range-thumb{pointer-events:auto;touch-action:none;width:24px;height:24px;z-index:10;position:relative}}`;
+        document.body.insertAdjacentHTML("beforeend", `<div class="tyc-overlay"><style>${css}</style><div class="tyc-modal" id="tyc-modal"><div class="tyc-header" id="tyc-drag"><div class="tyc-row"><label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:600"><input type="checkbox" id="tyc-all" class="tyc-chk" checked><span>${i18n.selectAll} (<span id="tyc-cnt" style="color:#2563eb;font-weight:bold">0</span>)</span></label><div style="height:20px;border-left:1px solid var(--tyc-border);margin:0 5px"></div><input type="text" id="tyc-fold" class="tyc-input" placeholder="${i18n.subFolder}"><button class="tyc-btn tyc-btn-gray" id="tyc-ren">${i18n.rename}</button><div style="height:20px;border-left:1px solid var(--tyc-border);margin:0 5px"></div><button class="tyc-btn tyc-btn-blue" id="tyc-dl" style="width:auto">${i18n.download}</button><button class="tyc-btn tyc-btn-green" id="tyc-zip" style="width:auto">${i18n.zip}</button><div style="flex:1"></div><button class="tyc-btn ${currentMode==='network'?'tyc-btn-purple':currentMode==='blob'?'tyc-btn-orange':'tyc-btn-gray'}" id="tyc-mode">${currentMode==='network'?i18n.modeNet:currentMode==='blob'?i18n.modeBlob:i18n.modeDef}</button><button class="tyc-btn tyc-btn-gray" id="tyc-filter">${i18n.filter}</button><button class="tyc-btn tyc-btn-gray" id="tyc-sort">${i18n.sort}</button><button class="tyc-btn tyc-btn-red" id="tyc-clear">${i18n.clear}</button><button class="tyc-btn tyc-btn-bmc" id="tyc-donate">☕ Donate</button><button class="tyc-btn tyc-btn-gray" id="tyc-zoom-out" title="Decrease UI Size" style="min-width:30px;padding:4px">-</button><button class="tyc-btn tyc-btn-gray" id="tyc-zoom-in" title="Increase UI Size" style="min-width:30px;padding:4px">+</button><button class="tyc-btn tyc-btn-gray" id="tyc-cls">✕</button></div><div class="tyc-filter-container" id="tyc-filter-container" style="display:none;gap:20px;width:100%;border-top:1px solid var(--tyc-border);padding-top:10px;margin-top:5px;flex-wrap:wrap">${['w','h'].map(t=>`<div class="tyc-filter-item" style="flex:1;min-width:150px"><div class="tyc-row" style="justify-content:space-between;margin-bottom:5px"><span style="font-size:11px;font-weight:700;color:#9ca3af">${t==='w'?i18n.width:i18n.height}</span><div style="display:flex;align-items:center;gap:4px;font-size:11px;color:#9ca3af"><input type="checkbox" id="tyc-chk-min-${t}" class="tyc-chk"><input type="number" id="tyc-min-${t}" class="tyc-input tyc-input-sm" value="${MIN_SIZE}" disabled><span>-</span><input type="number" id="tyc-max-${t}" class="tyc-input tyc-input-sm" value="${MAX_RANGE}" disabled><input type="checkbox" id="tyc-chk-max-${t}" class="tyc-chk"> px</div></div><div class="range-wrapper"><div class="range-track-bg"></div><div id="tyc-track-${t}" class="range-track-active"></div><input type="range" id="tyc-slide-min-${t}" min="${MIN_SIZE}" max="${MAX_RANGE}" value="${MIN_SIZE}" disabled><input type="range" id="tyc-slide-max-${t}" min="${MIN_SIZE}" max="${MAX_RANGE}" value="${MAX_RANGE}" disabled></div></div>`).join('')}</div></div><div class="tyc-grid" id="tyc-grid"></div></div></div>`);
+ 
+        updateThemeColors();
+ 
+        const modal = document.getElementById("tyc-modal"), drag = document.getElementById("tyc-drag");
+        let tx = 0, ty = 0;
+        const setTransform = () => { modal.style.transform = `translate(${tx}px, ${ty}px) scale(${uiZoom})`; };
+        setTransform();
+ 
+        document.getElementById('tyc-zoom-in').onclick = () => { uiZoom = Math.min(uiZoom + 0.1, 2.5); GM_setValue('uid_zoom_v1', uiZoom); setTransform(); };
+        document.getElementById('tyc-zoom-out').onclick = () => { uiZoom = Math.max(uiZoom - 0.1, 0.5); GM_setValue('uid_zoom_v1', uiZoom); setTransform(); };
+ 
+        let isDrag = false, startX, startY, initTx = 0, initTy = 0;
+        drag.onmousedown = (e) => {
+            if (!/INPUT|BUTTON|LABEL/.test(e.target.tagName)) {
+                isDrag = true; startX = e.clientX; startY = e.clientY; initTx = tx; initTy = ty;
+                drag.style.cursor = 'grabbing'; e.preventDefault();
+            }
+        };
+        document.onmousemove = (e) => {
+            if (isDrag) { tx = initTx + (e.clientX - startX) / uiZoom; ty = initTy + (e.clientY - startY) / uiZoom; setTransform(); }
+        };
+        document.onmouseup = () => { isDrag = false; drag.style.cursor = 'move'; };
+ 
+        const upT = (t, min, max) => { const mn=parseInt(min.min,10),mx=parseInt(min.max,10),v1=parseInt(min.value,10),v2=parseInt(max.value,10); t.style.left=((v1-mn)/(mx-mn))*100+'%'; t.style.width=(((v2-mn)/(mx-mn))*100)-parseFloat(t.style.left)+'%'; };
+        const upS = () => { ['w','h'].forEach(t => { const c1=document.getElementById(`tyc-chk-min-${t}`),c2=document.getElementById(`tyc-chk-max-${t}`),i1=document.getElementById(`tyc-min-${t}`),i2=document.getElementById(`tyc-max-${t}`),s1=document.getElementById(`tyc-slide-min-${t}`),s2=document.getElementById(`tyc-slide-max-${t}`),tr=document.getElementById(`tyc-track-${t}`); i1.disabled=s1.disabled=!c1.checked; i2.disabled=s2.disabled=!c2.checked; tr.classList.toggle("enabled",c1.checked||c2.checked); scheduleRender(); }); };
+ 
+        ['w','h'].forEach(t => {
+            const s1=document.getElementById(`tyc-slide-min-${t}`),s2=document.getElementById(`tyc-slide-max-${t}`),i1=document.getElementById(`tyc-min-${t}`),i2=document.getElementById(`tyc-max-${t}`),tr=document.getElementById(`tyc-track-${t}`);
+            const sync = (e) => {
+                let v1=parseInt(s1.value,10),v2=parseInt(s2.value,10);
+                if (v1>v2) { if (e.target===s1) { s1.value=v2; v1=v2; } else { s2.value=v1; v2=v1; } }
+                i1.value=v1; i2.value=v2; upT(tr,s1,s2); scheduleRender();
+                s1.style.zIndex=(e.target===s1)?10:5; s2.style.zIndex=(e.target===s2)?10:5;
+            };
+            const syncI = () => { let v1=Math.max(MIN_SIZE,parseInt(i1.value,10)||MIN_SIZE),v2=Math.max(MIN_SIZE,parseInt(i2.value,10)||MAX_RANGE); if(v1<=MAX_RANGE) s1.value=v1; if(v2<=MAX_RANGE) s2.value=v2; upT(tr,s1,s2); scheduleRender(); };
+            document.getElementById(`tyc-chk-min-${t}`).onchange = document.getElementById(`tyc-chk-max-${t}`).onchange = upS;
+            s1.oninput = s2.oninput = sync; i1.oninput = i2.oninput = syncI; upT(tr, s1, s2);
+        });
+ 
+        document.getElementById("tyc-filter").onclick = function () {
+            const fc = document.getElementById("tyc-filter-container");
+            fc.style.display = fc.style.display === "none" ? "flex" : "none";
+        };
+ 
+        document.getElementById("tyc-sort").onclick = function () { sortState=(sortState+1)%5; this.innerText=["Sort ⇅","Reverse ⇵","Name 🔢","Size ⬇️","Size ⬆️"][sortState]; scheduleRender(); };
+ 
+        const mb = document.getElementById("tyc-mode");
+        mb.onclick = () => {
+            if (currentMode === 'default') currentMode = 'network';
+            else if (currentMode === 'network') currentMode = 'blob';
+            else currentMode = 'default';
+            GM_setValue('uid_mode', currentMode);
+            mb.innerText = currentMode === 'network' ? i18n.modeNet : currentMode === 'blob' ? i18n.modeBlob : i18n.modeDef;
+            mb.className = "tyc-btn " + (currentMode === 'network' ? "tyc-btn-purple" : currentMode === 'blob' ? "tyc-btn-orange" : "tyc-btn-gray");
+            clearCache(false);
+            if (currentMode === 'default') triggerScan();
+        };
+ 
+        document.getElementById("tyc-clear").onclick = () => { if (confirm("Clear cache?")) clearCache(true); };
+        document.getElementById("tyc-ren").onclick = function () { this.innerText = (this.innerText === i18n.rename) ? i18n.original : i18n.rename; };
+        document.getElementById("tyc-all").onchange = (e) => { selIdx.clear(); if (e.target.checked) displayedIndices.forEach((_, i) => selIdx.add(i)); scheduleRender(); };
+        document.getElementById("tyc-donate").onclick = () => GM_openInTab("https://buymeacoffee.com/ozler", { active: true, insert: true });
+        document.getElementById("tyc-cls").onclick = () => { isUiOpen = false; document.querySelector(".tyc-overlay").remove(); };
+ 
+        const dl = async (zip) => {
+            if (isDownloading) { isDownloading = false; return; }
+            const idx = Array.from(selIdx).sort((a, b) => a - b);
+            if (!idx.length) return;
+ 
+            isDownloading = true;
+            const btnId = zip ? "tyc-zip" : "tyc-dl";
+            const otherBtnId = zip ? "tyc-dl" : "tyc-zip";
+            const renBtn = document.getElementById("tyc-ren");
+            const useOriginal = renBtn ? (renBtn.innerText === i18n.original) : false;
+            const foldInput = document.getElementById("tyc-fold");
+            const pre = foldInput?.value.trim() ? foldInput.value.trim() + "/" : "";
+ 
+            let btn = document.getElementById(btnId), otherBtn = document.getElementById(otherBtnId);
+            if (btn) { btn.innerText = i18n.stop; btn.classList.add("tyc-btn-red"); }
+            if (otherBtn) otherBtn.disabled = true;
+ 
+            const z = zip ? new JSZip() : null;
+            const used = new Set();
+ 
+            for (let i = 0; i < idx.length; i++) {
+                if (!isDownloading) break;
+                btn = document.getElementById(btnId);
+                if (btn && isDownloading) btn.innerText = `${i18n.stop} (${Math.round(((i+1)/idx.length)*100)}%)`;
+                try {
+                    const obj = displayedIndices[idx[i]], cd = canvasMap.get(getCanonicalUrl(obj.url));
+                    let b, ext = '.jpg';
+                    if (cd?.isScrambled && cd.instructions.length) {
+                        try { b = await unscrambleImage(await getImageBlob(obj.url), cd.instructions, cd.width, cd.height); ext = '.png'; } catch {}
+                    }
+                    if (!b) b = await convertToJpeg(await getImageBlob(obj.url));
+                    let n = useOriginal ? getFilename(obj.url) : `image${idx[i]+1}${ext}`;
+                    if (!IMG_EXT_REGEX.test(n)) n += ext;
+                    if (ext === '.png' && n.endsWith('.jpg')) n = n.replace('.jpg', '.png');
+                    let base = n, c = 1; while (used.has(n)) { const d = base.lastIndexOf('.'); n = (d>-1?base.slice(0,d):base)+`_${c++}`+(d>-1?base.slice(d):''); } used.add(n);
+                    if (zip) z.file(pre + n, b);
+                    else if (!C.mob && typeof GM_download === 'function') {
+                        const u = createObjUrl(b);
+                        GM_download({ url: u, name: pre + n, onload: () => URL.revokeObjectURL(u) });
+                        await new Promise(r => setTimeout(r, 200));
+                    } else {
+                        saveAs(b, n);
+                        await new Promise(r => setTimeout(r, 1500));
+                    }
+                } catch {}
+            }
+ 
+            btn = document.getElementById(btnId); otherBtn = document.getElementById(otherBtnId);
+            if (zip && isDownloading) {
+                if (btn) btn.innerText = "Generating...";
+                z.generateAsync({ type: "blob" }, m => { const b = document.getElementById(btnId); if (b) b.innerText = `${Math.round(m.percent)}%`; }).then(c => {
+                    const b = document.getElementById(btnId), ob = document.getElementById(otherBtnId);
+                    if (b) b.innerText = "100%";
+                    saveAs(c, document.title.replace(/[\\/:*?"<>|]/g, "_") + ".zip");
+                    setTimeout(() => { const fBtn = document.getElementById(btnId); if (fBtn) { fBtn.innerText = i18n.zip; fBtn.classList.remove("tyc-btn-red"); } if (ob) ob.disabled = false; isDownloading = false; }, 500);
+                });
+            } else {
+                if (btn) { btn.innerText = zip ? i18n.zip : i18n.download; btn.classList.remove("tyc-btn-red"); }
+                if (otherBtn) otherBtn.disabled = false;
+                isDownloading = false;
+            }
+        };
+        document.getElementById("tyc-dl").onclick = () => dl(false);
+        document.getElementById("tyc-zip").onclick = () => dl(true);
+        render();
+    }
+ 
+    function openUI() { if (document.querySelector(".tyc-overlay")) return; createUI(); isUiOpen = true; triggerScan(); }
+ 
+    backgroundLoop();
+    window.addEventListener('keydown', (e) => { if (e.altKey && e.code === 'KeyW') { e.preventDefault(); if (document.querySelector(".tyc-overlay")) { isUiOpen = false; document.querySelector(".tyc-overlay").remove(); } else openUI(); } }, true);
+    if (typeof GM_registerMenuCommand === "function") GM_registerMenuCommand(i18n.menuOpen, openUI);
+})();
